@@ -19,8 +19,8 @@
 
 # -- Project information -----------------------------------------------------
 
-project = 'WhatIsMyIP'
-copyright = '2018, Al Sweigart'
+project = 'whatismyip'
+copyright = '2018-2026, Al Sweigart'
 author = 'Al Sweigart'
 
 # The short X.Y version

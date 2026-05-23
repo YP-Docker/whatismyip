@@ -1,4 +1,6 @@
-import whatismyip
+import sys
+
+from whatismyip import _cli
 
 if __name__ == '__main__':
-    print(whatismyip.whatismyip())
+    sys.exit(_cli())

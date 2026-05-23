@@ -18,18 +18,54 @@ Example:
     'GIBSON'
 """
 
-__version__ = '2024.2.20'
+__version__ = '2026.5.22'
 
-import re
-import binascii
+import logging
 import random
+import re
 import socket
+import time
 import urllib.request
 
 from typing import Optional, Pattern, Tuple, Sequence
 
-# From https://stackoverflow.com/a/5284410/1893164
-IPV4_REGEX = re.compile(r"""((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\.|$)){4}""")  # type: Pattern
+_log = logging.getLogger(__name__)
+
+# Repeated calls to whatismyip()/whatismyipv4()/whatismyipv6() with default
+# arguments will reuse a result that was fetched less than this many seconds
+# ago. Short enough that a DHCP renewal or VPN connect is picked up quickly,
+# long enough to spare polling scripts from hammering STUN servers. Callers
+# that pass an explicit `sources=` argument always bypass the cache.
+_CACHE_TTL_SECONDS = 10
+_ip_cache = {}  # type: dict  # key (str) -> (expiry_monotonic, value)
+
+
+def _cache_get(key):
+    # type: (str) -> Optional[str]
+    entry = _ip_cache.get(key)
+    if entry is None:
+        return None
+    expiry, value = entry
+    if time.monotonic() >= expiry:
+        return None
+    return value
+
+
+def _cache_set(key, value):
+    # type: (str, str) -> None
+    _ip_cache[key] = (time.monotonic() + _CACHE_TTL_SECONDS, value)
+
+
+def _clear_cache():
+    # type: () -> None
+    """Discard any cached IP address results so the next call refetches.
+    Useful in tests or after a known network change (VPN toggle, etc.)."""
+    _ip_cache.clear()
+
+# Adapted from https://stackoverflow.com/a/5284410/1893164
+# Use with .fullmatch() — the regex itself only describes a well-formed IPv4 string.
+_IPV4_OCTET = r"(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)"
+IPV4_REGEX = re.compile(r"(" + _IPV4_OCTET + r"\.){3}" + _IPV4_OCTET)  # type: Pattern
 
 # From https://stackoverflow.com/a/17871737/1893164
 IPV6_REGEX = re.compile(
@@ -57,26 +93,30 @@ fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|     # fe80::7:8%eth0   fe80::7:8%
 
 # If you have an IPv4 *and* IPv6 address, these websites give you your IPv4 address.
 # (I haven't tested what they do if you only have an IPv6 address.)
-IP4_WEBSITES = ('https://ifconfig.co/ip',
-                'https://v4.ident.me',
-                'https://v4.tnedi.me',
-                'https://ipinfo.io/ip',
-                'https://ipecho.net/plain',
-                'https://api.ipify.org',
-                'https://ipaddr.site',
-                'https://ifconfig.me/ip',
+# Ordered by response time (fastest first). Re-test by running _profile_https_servers().
+# Last re-profiled: 2026-05-22 from Brooklyn, NY, USA.
+IP4_WEBSITES = ('https://api.ipify.org',
                 'https://checkip.amazonaws.com/',
+                'https://ipecho.net/plain',
+                'https://ifconfig.me/ip',
+                'https://ipinfo.io/ip',
+                'https://v4.tnedi.me',
+                'https://v4.ident.me',
+                # Removed 2026-05-22:
+                # 'https://ifconfig.co/ip' — now behind a Cloudflare JS challenge (returns 403).
+                # 'https://ipaddr.site'   — TLS certificate expired.
                 )
 
 # Note: In the event that your system only has an IPv4 address and no IPv6 address,
 # these websites will return your IPv4 address.
+# Ordered by response time (fastest first). Last re-profiled: 2026-05-22.
 IP6_WEBSITES = ('https://icanhazip.com',
-                'https://v6.ident.me',
-                'https://v6.tnedi.me',
-                'https://tnedi.me/',
-                'https://curlmyip.net',
-                #'https://ip.seeip.org',  # Tested on 2024/02/20, had an certificate that expired on 2023/10/03
                 'https://wtfismyip.com/text',
+                'https://curlmyip.net',
+                'https://v6.ident.me',
+                'https://tnedi.me/',
+                'https://v6.tnedi.me',
+                # 'https://ip.seeip.org' — service offline as of 2026-05-22.
                 )
 
 IP_WEBSITES = IP4_WEBSITES + IP6_WEBSITES
@@ -85,33 +125,43 @@ IP_WEBSITES = IP4_WEBSITES + IP6_WEBSITES
 # Example: http://checkip.dyndns.org
 
 # Popular web servers to test if we are online. (2024/02/20 - youtube.com was removed since it is blocked in some countries)
-ONLINE_WEB_SERVERS = ('google.com', 'facebook.com', 'yahoo.com', 'reddit.com', 'wikipedia.org', 'ebay.com', 'bing.com', 'netflix.com', 'office.com', 'twitch.com', 'cnn.com', 'linkedin.com')
+ONLINE_WEB_SERVERS = ('google.com', 'facebook.com', 'yahoo.com', 'reddit.com', 'wikipedia.org', 'ebay.com', 'bing.com', 'netflix.com', 'office.com', 'twitch.tv', 'cnn.com', 'linkedin.com')
 
 
 # Responsive servers that responded in less than 0.3 seconds, in order of fastest response time. Re-test their speeds by calling _profile_stun_servers().
-
-# Tested on 2023/04/27 from Houston, TX, USA:
-#STUN_SERVERS = ('stun.epygi.com:3478', 'stun.l.google.com:19302', 'stun.l.google.com:3478', 'relay.webwormhole.io:3478', 'stun.ooma.com:3478', 'stun.usfamily.net:3478', 'stun.rackco.com:3478', 'stun.voip.blackberry.com:3478', 'stun.freeswitch.org:3478', 'stun.voip.aebc.com:3478', 'stun.callwithus.com:3478', 'stun.vivox.com:3478', 'stun.ippi.fr:3478', 'stun.12connect.com:3478', 'stun.12voip.com:3478', 'stun.acrobits.cz:3478', 'stun.actionvoip.com:3478', 'stun.aeta.com:3478', 'stun.voipzoom.com:3478', 'stun3.l.google.com:19302', 'stun.1und1.de:3478', 'stun.aeta-audio.com:3478', 'stun.jumblo.com:3478', 'stun1.l.google.com:19302', 'iphone-stun.strato-iphone.de:3478', 'stun.antisip.com:3478', 'stun.it1.hr:3478', 'stun.ivao.aero:3478', 'stun4.l.google.com:19302', 'stun.etoilediese.fr:3478', 'stun.voippro.com:3478', 'stun.voipstunt.com:3478', 'stun.altar.com.pl:3478', 'stun.voipbuster.com:3478', 'stun.voipwise.com:3478', 'stun.voys.nl:3478', 'stun.internetcalls.com:3478', 'stun.ipshka.com:3478', 'stun.powervoip.com:3478', 'stun.rynga.com:3478', 'stun2.l.google.com:19302', 'stun.callromania.ro:3478', 'stun.gmx.net:3478', 'stun.linphone.org:3478', 'stun.myvoiptraffic.com:3478', 'stun.mywatson.it:3478', 'stun.schlund.de:3478', 'stun.sipgate.net:10000', 'stun.zoiper.com:3478', 'stun.voip.eutelia.it:3478', 'stun.voipbusterpro.com:3478', 'stun.voipgate.com:3478', 'stun.gmx.de:3478', 'stun.annatel.net:3478', 'stun.sipnet.ru:3478', 'stun.t-online.de:3478', 'stun.cheapvoip.com:3478', 'stun.easyvoip.com:3478', 'stun.intervoip.com:3478', 'stun.lowratevoip.com:3478', 'stun.nonoh.net:3478', 'stun.siptraffic.com:3478', 'stun.smartvoip.com:3478', 'stun.telbo.com:3478', 'stun.voipblast.com:3478', 'stun.voipgain.com:3478', 'stun.voipinfocenter.com:3478', 'stun.webcalldirect.com:3478', 'stun.zadarma.com:3478', 'stun.nextcloud.com:443', 'stun.freecall.com:3478', 'stun.justvoip.com:3478', 'stun.netappel.com:3478', 'stun.bluesip.net:3478', 'stun.freevoipdeal.com:3478', 'stun.voicetrading.com:3478', 'stun.voipcheap.co.uk:3478', 'stun.voipcheap.com:3478', 'stun.voipraider.com:3478', 'stun.dcalling.de:3478', 'stun.liveo.fr:3478', 'stun.lundimatin.fr:3478', 'stun.poivy.com:3478', 'stun.ppdi.com:3478', 'stun.xtratelecom.es:3478', 'stun.hoiio.com:3478', 'stun.voztele.com:3478', 'stun.mit.de:3478', 'stun.tng.de:3478', 'stun.pjsip.org:3478', 'stun.sipnet.net:3478', 'stun.twt.it:3478', 'stun.solnet.ch:3478', 'stun.cope.es:3478', 'stun.dus.net:3478', 'stun.cablenet-as.net:3478', 'stun.sovtest.ru:3478', 'stun.uls.co.za:3478', 'stun.halonet.pl:3478', 'stun.demos.ru:3478', 'stun.siplogin.de:3478', 'stun.cloopen.com:3478', 'stun.hosteurope.de:3478', 'stun.rockenstein.de:3478', 'stun.easycall.pl:3478')
-# Tested on 2024/02/20 from Brooklyn, NY, USA:
-STUN_SERVERS = ('stun.freeswitch.org:3478', 'stun.l.google.com:19302', 'stun.l.google.com:3478', 'stun.voip.blackberry.com:3478', 'stun.vivox.com:3478', 'stun.usfamily.net:3478', 'stun.epygi.com:3478', 'stun.voipzoom.com:3478', 'stun.rynga.com:3478', 'stun2.l.google.com:19302', 'stun.voipbusterpro.com:3478', 'stun.cheapvoip.com:3478', 'stun.easyvoip.com:3478', 'stun.lowratevoip.com:3478', 'stun.nonoh.net:3478', 'stun.siptraffic.com:3478', 'stun.voipinfocenter.com:3478', 'stun.webcalldirect.com:3478', 'stun.freecall.com:3478', 'stun.justvoip.com:3478', 'stun.voicetrading.com:3478', 'stun.dcalling.de:3478', 'stun.liveo.fr:3478', 'stun.voip.aebc.com:3478', 'stun.ippi.fr:3478', 'stun.12voip.com:3478', 'stun3.l.google.com:19302', 'stun.jumblo.com:3478', 'stun.voipstunt.com:3478', 'stun.internetcalls.com:3478', 'stun.freevoipdeal.com:3478', 'stun.voipcheap.com:3478', 'stun.voipraider.com:3478', 'stun.actionvoip.com:3478', 'stun.powervoip.com:3478', 'stun.myvoiptraffic.com:3478', 'stun.intervoip.com:3478', 'stun.smartvoip.com:3478', 'stun.telbo.com:3478', 'stun.voipblast.com:3478', 'stun.voipgain.com:3478', 'stun.netappel.com:3478', 'stun.acrobits.cz:3478', 'stun.antisip.com:3478', 'stun.voipwise.com:3478', 'stun.voipgate.com:3478', 'stun.zadarma.com:3478', 'stun.twt.it:3478', 'stun.solnet.ch:3478', 'stun4.l.google.com:19302', 'stun.voippro.com:3478', 'stun.mywatson.it:3478', 'stun.t-online.de:3478', 'stun.ppdi.com:3478', 'stun.tng.de:3478', 'stun.siplogin.de:3478', 'stun.linphone.org:3478', 'stun.sipgate.net:10000', 'stun.gmx.de:3478', 'stun.voipcheap.co.uk:3478', 'stun.aeta.com:3478', 'stun.1und1.de:3478', 'stun.aeta-audio.com:3478', 'stun.callromania.ro:3478', 'stun.gmx.net:3478', 'stun.schlund.de:3478', 'stun.voip.eutelia.it:3478', 'stun.bluesip.net:3478', 'stun.voztele.com:3478', 'stun.rockenstein.de:3478', 'stun.voipbuster.com:3478', 'stun.it1.hr:3478', 'stun.12connect.com:3478', 'stun.zoiper.com:3478', 'stun.voys.nl:3478', 'stun.nextcloud.com:443', 'stun.dus.net:3478', 'stun.poivy.com:3478', 'stun.ipshka.com:3478', 'stun.halonet.pl:3478', 'stun1.l.google.com:19302', 'stun.cablenet-as.net:3478', 'stun.annatel.net:3478', 'stun.cope.es:3478', 'stun.hoiio.com:3478', 'stun.uls.co.za:3478')
+# Last re-profiled: 2026-05-22 from Brooklyn, NY, USA. 77 servers (down from 85 in 2024-02-20 — see git log for the previous lists).
+STUN_SERVERS = ('stun.l.google.com:19302', 'stun.l.google.com:3478', 'stun2.l.google.com:19302', 'stun3.l.google.com:19302', 'stun1.l.google.com:19302', 'stun4.l.google.com:19302', 'stun.usfamily.net:3478', 'stun.epygi.com:3478', 'stun.voip.aebc.com:3478', 'stun.voipzoom.com:3478', 'stun.voys.nl:3478', 'stun.lowratevoip.com:3478', 'stun.voicetrading.com:3478', 'stun.voippro.com:3478', 'stun.freeswitch.org:3478', 'stun.aeta-audio.com:3478', 'stun.voipbuster.com:3478', 'stun.internetcalls.com:3478', 'stun.actionvoip.com:3478', 'stun.acrobits.cz:3478', 'stun.linphone.org:3478', 'stun.sipgate.net:10000', 'stun.voip.blackberry.com:3478', 'stun.cheapvoip.com:3478', 'stun.easyvoip.com:3478', 'stun.siptraffic.com:3478', 'stun.12voip.com:3478', 'stun.voipstunt.com:3478', 'stun.myvoiptraffic.com:3478', 'stun.telbo.com:3478', 'stun.voipgate.com:3478', 'stun.poivy.com:3478', 'stun.netappel.com:3478', 'stun.voipwise.com:3478', 'stun.twt.it:3478', 'stun.siplogin.de:3478', 'stun.rynga.com:3478', 'stun.justvoip.com:3478', 'stun.ippi.fr:3478', 'stun.freevoipdeal.com:3478', 'stun.voipblast.com:3478', 'stun.voip.eutelia.it:3478', 'stun.voipraider.com:3478', 'stun.powervoip.com:3478', 'stun.voipgain.com:3478', 'stun.jumblo.com:3478', 'stun.voipcheap.com:3478', 'stun.schlund.de:3478', 'stun.nonoh.net:3478', 'stun.freecall.com:3478', 'stun.smartvoip.com:3478', 'stun.nextcloud.com:443', 'stun.voipbusterpro.com:3478', 'stun.intervoip.com:3478', 'stun.callromania.ro:3478', 'stun.gmx.net:3478', 'stun.zoiper.com:3478', 'stun.1und1.de:3478', 'stun.voipinfocenter.com:3478', 'stun.webcalldirect.com:3478', 'stun.cablenet-as.net:3478', 'stun.solnet.ch:3478', 'stun.zadarma.com:3478', 'stun.ppdi.com:3478', 'stun.cope.es:3478', 'stun.halonet.pl:3478', 'stun.annatel.net:3478', 'stun.t-online.de:3478', 'stun.liveo.fr:3478', 'stun.voztele.com:3478', 'stun.mywatson.it:3478', 'stun.dcalling.de:3478', 'stun.aeta.com:3478', 'stun.hoiio.com:3478', 'stun.gmx.de:3478', 'stun.dus.net:3478', 'stun.it1.hr:3478', 'stun.uls.co.za:3478')
 
 
-# STUN attributes, in hex:
-MAPPED_ADDRESS = '0001'
-STUN_ATTR_LEN = 4
+# STUN attribute types (RFC 5389 §15):
+MAPPED_ADDRESS = b'\x00\x01'
+STUN_ATTR_LEN = 4  # bytes of header per attribute (type + length)
 
-# STUN message types, in hex:
-BIND_REQUEST_MSG = '0001'
-BIND_RESPONSE_MSG = '0101'
+# STUN message types (RFC 5389 §6):
+BIND_REQUEST_MSG = b'\x00\x01'
+BIND_RESPONSE_MSG = b'\x01\x01'
 
 # Note: Because this module is named whatismyip and it's a small module that likely people will only use for its
-# whatismyip() function, I've kept the all lowercase, no underscore naming convention for the public functions.
+# whatismyip() function, I've kept the all-lowercase, no-underscore naming convention for the public functions.
 # It would be too confusing to have whatismyip.what_is_my_ip(). Please don't complain about pep8 to me.
 
-def whatismyip():
+def whatismyip(sources=None):
     # type: (Optional[Sequence[str]]) -> Optional[str]
-    """Returns a str of your IP address, either IPv4 or IPv6. If offline or
-    the IP address can't be determined, this returns None."""
+    """Returns a str of your IP address, either IPv4 or IPv6, or None if offline
+    or the IP address can't be determined.
+
+    :param sources: Optional sequence of HTTPS endpoints that return an IP
+        address (similar to the entries in IP_WEBSITES). When provided, STUN
+        is skipped and only these endpoints are consulted, and the result
+        is not cached.
+    :type sources: sequence of str, or None.
+    """
+    if sources is not None:
+        return _get_ip_from_https(web_servers=sources)
+
+    cached = _cache_get('any')
+    if cached is not None:
+        return cached
 
     # Get ipv4 address from STUN servers first (they tend to be faster than the websites):
     # Note: STUN servers only return IPv4 addresses. This means that whatismyip() will almost
@@ -120,9 +170,13 @@ def whatismyip():
     for i in range(3):  # Make 3 attempts, otherwise assume accessing STUN is blocked for some reason.
         ip = _get_ip_from_stun()  # Check a random STUN server.
         if ip is not None:
+            _cache_set('any', ip)
             return ip
 
-    return _get_ip_from_https()
+    ip = _get_ip_from_https()
+    if ip is not None:
+        _cache_set('any', ip)
+    return ip
 
 
 def whatismyipv4():
@@ -130,24 +184,48 @@ def whatismyipv4():
     """Returns a str of your IPv4 address. If offline or the IP address can't
     be determined, this returns None."""
 
+    cached = _cache_get('v4')
+    if cached is not None:
+        return cached
+
     # Get ipv4 address from STUN servers first (they tend to be faster than the websites):
     # Note: STUN servers only return IPv4 addresses. (TODO: Test this claim.)
     for i in range(3):  # Make 3 attempts, otherwise assume accessing STUN is blocked for some reason.
         ip = _get_ip_from_stun()  # Check a random STUN server.
         if ip is not None:
+            _cache_set('v4', ip)
             return ip
 
-    return _get_ip_from_https(4)
+    ip = _get_ip_from_https(4)
+    if ip is not None:
+        _cache_set('v4', ip)
+    return ip
 
 
 def whatismyipv6():
     # type: () -> Optional[str]
     """Returns a str of your IPv6 address, or None if offline or you don't have an IPv6 address."""
-    return _get_ip_from_https(6)
+    cached = _cache_get('v6')
+    if cached is not None:
+        return cached
+    ip = _get_ip_from_https(6)
+    if ip is not None:
+        _cache_set('v6', ip)
+    return ip
 
 
 def whatismylocalip():
-    return tuple(socket.gethostbyname_ex(socket.gethostname())[2])
+    # type: () -> Tuple[str, ...]
+    """Returns a tuple of local IP address strings — one entry per network
+    interface on the machine. These are LAN addresses (e.g. 192.168.x.x),
+    not the public IP returned by `whatismyip()`. Returns an empty tuple
+    if the local hostname can't be resolved (a common quirk on freshly
+    configured macOS machines)."""
+    try:
+        return tuple(socket.gethostbyname_ex(socket.gethostname())[2])
+    except socket.gaierror as exc:
+        _log.debug('whatismylocalip: hostname resolution failed: %r', exc)
+        return ()
 
 
 def whatismyhostname():
@@ -155,7 +233,22 @@ def whatismyhostname():
     return socket.gethostname()
 
 
-def amionline(web_servers=None): # type: (Optional[List[str]]) -> bool
+def _cli():
+    # type: () -> int
+    """Entry point used by both `python -m whatismyip` and the
+    `whatismyip` console script. Prints the IP (if available) and
+    returns an exit code: 0 on success, 1 if no IP could be determined."""
+    ip = whatismyip()
+    if ip is None:
+        import sys
+        print('Could not determine your IP address.', file=sys.stderr)
+        return 1
+    print(ip)
+    return 0
+
+
+def amionline(web_servers=None):
+    # type: (Optional[Sequence[str]]) -> bool
     """Return True if the system is currently on the internet, otherwise returns False.
 
     It determines this by attempting to connect to a popular web server in the `ONLINE_WEB_SERVERS` list.
@@ -169,22 +262,21 @@ def amionline(web_servers=None): # type: (Optional[List[str]]) -> bool
     # If web_servers is not provided, use the default list of popular web servers.
     if web_servers is None:
         web_servers = list(ONLINE_WEB_SERVERS)
+    else:
+        web_servers = list(web_servers)
 
     # Shuffle the list of web servers to try a random sequence.
     random.shuffle(web_servers)
 
     # Try to connect to up to 3 randomly selected web servers.
-    for i in range(3):
+    for server in web_servers[:3]:
         try:
-            # Attempt to get address information for the current web server.
-            socket.getaddrinfo(web_servers[i], 'www')
-            # If successful, return True to indicate that the system is online.
+            socket.getaddrinfo(server, 'www')
             return True
         except socket.gaierror:
-            # If an error occurs, continue to the next server in the shuffled list.
             continue
 
-    # If all three attempts have failed, return False to indicate that the system is offline.
+    # If all attempts have failed (or web_servers was empty), the system is offline.
     return False
 
 # Note: Private functions will use snake_case.
@@ -210,7 +302,7 @@ def _get_ip_from_https(ip_version=None, web_servers=None):
 
     for ipWebsite in ipWebsites:  # Go through all ip website servers, return the first valid response.
         try:
-            response = urllib.request.urlopen(ipWebsite)
+            response = urllib.request.urlopen(ipWebsite, timeout=5)
 
             charsets = response.info().get_charsets()
             if len(charsets) == 0 or charsets[0] is None:
@@ -220,37 +312,34 @@ def _get_ip_from_https(ip_version=None, web_servers=None):
 
             userIp = response.read().decode(charset).strip()
 
-            if ip_version == 4 and IPV4_REGEX.match(userIp):
+            if ip_version == 4 and IPV4_REGEX.fullmatch(userIp):
                 return userIp
-            elif ip_version == 6 and IPV6_REGEX.match(userIp):
+            elif ip_version == 6 and IPV6_REGEX.fullmatch(userIp):
                 return userIp
-            elif ip_version is None and (IPV4_REGEX.match(userIp) or IPV6_REGEX.match(userIp)):
+            elif ip_version is None and (IPV4_REGEX.fullmatch(userIp) or IPV6_REGEX.fullmatch(userIp)):
                 return userIp
             else:
                 # Either the ip_version argument is invalid or the ip website
                 # returned some unexpected text that is not an IP address.
                 # (Or the user asked for, say, ipv4 and got an ipv6 address.)
+                _log.debug('Unexpected response from %s: %r', ipWebsite, userIp)
                 continue
-        except:
-            pass  # Network error, just continue on to next website.
+        except Exception as exc:
+            _log.debug('Failed to fetch IP from %s: %r', ipWebsite, exc)
 
     # Either all of the websites are down or returned invalid response
     # (unlikely) or you are disconnected from the internet (likely).
     return None
 
 
-def _b2hex(abytes):
-    # type: (bytes) -> str
-    """Converts bytes to an ascii string of hex digits, e.g. """
-    return binascii.b2a_hex(abytes).decode('ascii')
-
-
 def _get_ip_from_stun(stun_servers=None):
-    # type: (Optional[str], Optional[int]) -> Optional[str]
-    """Retrieves the IPv4 address from a STUN (Session Traversal Utilities for NAT) server. If stunHost and stunPort
-    aren't specified, then a public STUN server is randomly selected from the STUN_SERVERS tuple."""
+    # type: (Optional[Sequence[str]]) -> Optional[str]
+    """Retrieves the IPv4 address from a STUN (Session Traversal Utilities for
+    NAT) server. If `stun_servers` isn't specified, a public STUN server is
+    randomly selected from the STUN_SERVERS tuple. Each entry must be a
+    `'host:port'` string."""
     SOURCE_IP = '0.0.0.0'
-    SOURCE_PORT = 54320
+    SOURCE_PORT = 0  # 0 means the OS picks an ephemeral port for us.
 
     if stun_servers is None:
         # If a STUN server isn't provided, use a random one from the STUN_SERVERS:
@@ -265,60 +354,58 @@ def _get_ip_from_stun(stun_servers=None):
     stunHost, stunPortStr = stunServer.split(':')
     stunPort = int(stunPortStr)
 
-    sockObj = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sockObj.settimeout(2)
-    sockObj.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sockObj.bind((SOURCE_IP, SOURCE_PORT))
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sockObj:
+        sockObj.settimeout(2)
+        sockObj.bind((SOURCE_IP, SOURCE_PORT))
 
-    # STUN transaction IDs are arbitrary numbers:
-    transID = ''.join(random.choice('0123456789ABCDEF') for i in range(32))
+        # STUN transaction IDs are 16 arbitrary bytes:
+        transID = bytes(random.randrange(256) for _ in range(16))
 
-    data = binascii.a2b_hex(BIND_REQUEST_MSG + '0000' + transID)
-    while True:
+        # STUN Binding Request: 2-byte type, 2-byte length (0), 16-byte transaction ID.
+        data = BIND_REQUEST_MSG + b'\x00\x00' + transID
         attempts_remaining = 3
         while True:
             # Loop until we get a response or run out of retry attempts.
             try:
                 sockObj.sendto(data, (stunHost, stunPort))
-            except socket.gaierror:
+            except socket.gaierror as exc:
                 # Most likely you are offline.
+                _log.debug('STUN sendto failed for %s: %r', stunServer, exc)
                 return None
 
             try:
                 buf, addr = sockObj.recvfrom(2048)
                 break
-            except Exception:
+            except Exception as exc:
                 attempts_remaining -= 1
                 if attempts_remaining == 0:
+                    _log.debug('STUN recvfrom from %s gave up after retries: %r', stunServer, exc)
                     return None  # Could not connect to the stun server.
 
-        transIDMatch = transID.upper() == _b2hex(buf[4:20]).upper()
-        if transIDMatch and _b2hex(buf[0:2]) == BIND_RESPONSE_MSG:
-            message_remaining = int(_b2hex(buf[2:4]), 16)
-            base = 20
-            while message_remaining:
-                stunAttribute = _b2hex(buf[base:(base + 2)])
-                stunAttributeLength = int(_b2hex(buf[(base + 2):(base + 4)]), 16)
+        if buf[0:2] != BIND_RESPONSE_MSG or buf[4:20] != transID:
+            # Malformed or unexpected response; let the caller try a different server.
+            _log.debug('STUN %s sent unexpected response: type=%s transIDMatch=%s',
+                       stunServer, buf[0:2].hex(), buf[4:20] == transID)
+            return None
 
-                ip = '.'.join([
-                    str(int(_b2hex(buf[base + 8:base + 9]), 16)),
-                    str(int(_b2hex(buf[base + 9:base + 10]), 16)),
-                    str(int(_b2hex(buf[base + 10:base + 11]), 16)),
-                    str(int(_b2hex(buf[base + 11:base + 12]), 16))
-                ])
+        message_remaining = int.from_bytes(buf[2:4], 'big')
+        base = 20
+        while message_remaining:
+            stunAttribute = buf[base:base + 2]
+            stunAttributeLength = int.from_bytes(buf[base + 2:base + 4], 'big')
 
-                if stunAttribute == MAPPED_ADDRESS:
-                    # There are several IP addresses in the STUN response, but only MAPPED_ADDRESS is our user's IP.
-                    return ip
-                else:
-                    pass # We ignore all the other stun attributes.
+            if stunAttribute == MAPPED_ADDRESS:
+                # Inside a MAPPED_ADDRESS attribute the layout is:
+                #   [0:1]  reserved (0)   [1:2]  address family
+                #   [2:4]  mapped port    [4:8]  IPv4 address
+                return socket.inet_ntoa(buf[base + 8:base + 12])
+            # All other STUN attributes are ignored.
 
-                base += STUN_ATTR_LEN + stunAttributeLength
-                message_remaining -= STUN_ATTR_LEN + stunAttributeLength
-            break
+            base += STUN_ATTR_LEN + stunAttributeLength
+            message_remaining -= STUN_ATTR_LEN + stunAttributeLength
 
-    sockObj.close()
-    return ip
+        # No MAPPED_ADDRESS attribute was found in the response.
+        return None
 
 
 

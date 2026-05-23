@@ -25,20 +25,21 @@ Because whatismyip relies on online services, you always want to update to the l
 
 # How Does whatismyip Work?
 
-There are several public STUN (Session Traversal Utilities for NAT) servers (listed in the whatismip.STUN_SERVERS variable, listed in order of response speed) that return your IP address (as it appears to them). There are also several public websites that you can view in your browser (listed in the whatismyip.IP4_WEBSITES, whatismyip.IP6_WEBSITES, and whatismyip.IP_WEBSITES):
+There are several public STUN (Session Traversal Utilities for NAT) servers (listed in the `whatismyip.STUN_SERVERS` variable, in order of response speed) that return your IP address (as it appears to them). There are also several public websites that you can view in your browser (listed in `whatismyip.IP4_WEBSITES`, `whatismyip.IP6_WEBSITES`, and `whatismyip.IP_WEBSITES`):
 
-* [https://ifconfig.co/ip](https://ifconfig.co/ip)
+* [https://api.ipify.org](https://api.ipify.org)
+* [https://checkip.amazonaws.com/](https://checkip.amazonaws.com/)
 * [https://icanhazip.com](https://icanhazip.com)
 * [https://ipinfo.io/ip](https://ipinfo.io/ip)
 * [https://ipecho.net/plain](https://ipecho.net/plain)
-* [https://v6.ident.me](https://v6.ident.me)
+* [https://ifconfig.me/ip](https://ifconfig.me/ip)
 * [https://v4.ident.me](https://v4.ident.me)
-* [https://v6.tnedi.me](https://v6.tnedi.me)
+* [https://v6.ident.me](https://v6.ident.me)
 * [https://v4.tnedi.me](https://v4.tnedi.me)
+* [https://v6.tnedi.me](https://v6.tnedi.me)
+* [https://tnedi.me/](https://tnedi.me/)
 * [https://curlmyip.net](https://curlmyip.net)
-* [https://api.ipify.org](https://api.ipify.org)
-* [https://ipaddr.site](https://ipaddr.site)
-* [https://ip.seeip.org](https://ip.seeip.org)
+* [https://wtfismyip.com/text](https://wtfismyip.com/text)
 
 The whatismyip module does not have any dependencies outside the Python standard library. It does not require Requests to be installed.
 
